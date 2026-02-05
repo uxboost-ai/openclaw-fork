@@ -1,26 +1,33 @@
 #!/usr/bin/env bash
-# Set up the OpenClaw Gateway on a fresh Ubuntu 24.04 GCP VM.
+# Set up the OpenClaw Gateway on a fresh GCP VM (Ubuntu/Debian).
 #
 # Follows best practices from https://github.com/openclaw/openclaw:
 #   - Docker build from source (non-root container, uid 1000)
-#   - Gateway bound to loopback only (access via SSH tunnel)
+#   - Gateway with --allow-unconfigured for web dashboard access
 #   - Strong token-based auth
 #   - Persistent host volumes for config/workspace
 #   - Proper file permissions (0600 for secrets, 0700 for config dirs)
-#   - systemd service for automatic restart
+#   - Swap + disk expansion for low-memory VMs
+#   - Google Gemini model support out of the box
 #
 # Usage (run on the VM):
 #   bash ~/setup-vm.sh
 #
+# Environment variables (optional):
+#   GOOGLE_AI_API_KEY  - Google AI API key for Gemini models
+#   ANTHROPIC_API_KEY  - Anthropic API key for Claude models
+#   OPENCLAW_MODEL     - Model to use (default: google/gemini-3-flash-preview)
+#
 # After setup, access the gateway from your laptop:
 #   gcloud compute ssh openclaw-server --zone=us-east1-c -- -L 18789:127.0.0.1:18789
-#   Then open http://127.0.0.1:18789/
+#   Then open the tokenized dashboard URL printed at the end of setup.
 
 set -euo pipefail
 
 REPO_URL="https://github.com/openclaw/openclaw.git"
 REPO_DIR="$HOME/openclaw"
 IMAGE_NAME="openclaw:local"
+MODEL="${OPENCLAW_MODEL:-google/gemini-3-flash-preview}"
 
 echo "============================================"
 echo "  OpenClaw Gateway - GCP VM Setup"
@@ -28,12 +35,40 @@ echo "============================================"
 echo ""
 
 # --- Step 1: System packages ---
-echo "==> [1/8] Installing system packages..."
+echo "==> [1/10] Installing system packages..."
 sudo apt-get update -qq
-sudo apt-get install -y -qq git curl ca-certificates gnupg lsb-release openssl
+sudo apt-get install -y -qq git curl ca-certificates gnupg lsb-release openssl cloud-guest-utils
 
-# --- Step 2: Docker ---
-echo "==> [2/8] Installing Docker..."
+# --- Step 2: Ensure disk partition is fully expanded ---
+echo "==> [2/10] Expanding disk partition..."
+ROOT_DEV="$(findmnt -n -o SOURCE /)"
+# Extract disk device and partition number (e.g., /dev/sda1 -> /dev/sda, 1)
+DISK_DEV="$(echo "$ROOT_DEV" | sed 's/[0-9]*$//')"
+PART_NUM="$(echo "$ROOT_DEV" | grep -o '[0-9]*$')"
+if [[ -n "$DISK_DEV" && -n "$PART_NUM" ]]; then
+  sudo growpart "$DISK_DEV" "$PART_NUM" 2>/dev/null || true
+  sudo resize2fs "$ROOT_DEV" 2>/dev/null || true
+fi
+echo "  Disk: $(df -h / | awk 'NR==2{print $2 " total, " $4 " available"}')"
+
+# --- Step 3: Set up swap (prevents OOM during Docker build) ---
+echo "==> [3/10] Configuring swap..."
+if swapon --show | grep -q .; then
+  echo "  Swap already active: $(free -h | awk '/Swap/{print $2}')"
+else
+  sudo fallocate -l 4G /swapfile
+  sudo chmod 600 /swapfile
+  sudo mkswap /swapfile >/dev/null
+  sudo swapon /swapfile
+  # Make persistent across reboots
+  if ! grep -q '/swapfile' /etc/fstab 2>/dev/null; then
+    echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
+  fi
+  echo "  Swap created: 4GB"
+fi
+
+# --- Step 4: Docker ---
+echo "==> [4/10] Installing Docker..."
 if command -v docker >/dev/null 2>&1; then
   echo "  Docker already installed: $(docker --version)"
 else
@@ -47,13 +82,12 @@ DOCKER_CMD="docker"
 if ! docker info >/dev/null 2>&1; then
   DOCKER_CMD="sudo docker"
 fi
-COMPOSE_CMD="$DOCKER_CMD compose"
 
 echo "  Docker: $($DOCKER_CMD --version)"
-echo "  Compose: $($COMPOSE_CMD version)"
+echo "  Compose: $($DOCKER_CMD compose version)"
 
-# --- Step 3: Node.js 22 (for CLI usage outside Docker) ---
-echo "==> [3/8] Installing Node.js 22..."
+# --- Step 5: Node.js 22 (for CLI usage outside Docker) ---
+echo "==> [5/10] Installing Node.js 22..."
 if command -v node >/dev/null 2>&1 && node -v | grep -q "^v2[2-9]\|^v[3-9]"; then
   echo "  Node.js already installed: $(node -v)"
 else
@@ -62,39 +96,41 @@ else
   echo "  Node.js installed: $(node -v)"
 fi
 
-# --- Step 4: Clone repository ---
-echo "==> [4/8] Cloning OpenClaw repository..."
+# --- Step 6: Clone repository ---
+echo "==> [6/10] Cloning OpenClaw repository..."
 if [[ -d "$REPO_DIR" ]]; then
   echo "  Repository already exists at $REPO_DIR, pulling latest..."
   cd "$REPO_DIR"
-  git pull --rebase origin main
+  git pull --rebase origin main || true
 else
   git clone "$REPO_URL" "$REPO_DIR"
   cd "$REPO_DIR"
 fi
 
-# --- Step 5: Persistent directories with secure permissions ---
-echo "==> [5/8] Creating persistent directories..."
+# --- Step 7: Persistent directories with secure permissions ---
+echo "==> [7/10] Creating persistent directories..."
 mkdir -p "$HOME/.openclaw"
 mkdir -p "$HOME/.openclaw/workspace"
 mkdir -p "$HOME/.openclaw/credentials"
+mkdir -p "$HOME/.openclaw/agents/main/agent"
+
 # Restrict config dir: only owner can read/write (contains tokens, session data)
 chmod 700 "$HOME/.openclaw"
 chmod 700 "$HOME/.openclaw/credentials"
 chmod 755 "$HOME/.openclaw/workspace"
+
 echo "  Config:      $HOME/.openclaw (mode 700)"
 echo "  Credentials: $HOME/.openclaw/credentials (mode 700)"
 echo "  Workspace:   $HOME/.openclaw/workspace (mode 755)"
 
-# --- Step 6: Generate .env with secure defaults ---
-echo "==> [6/8] Generating environment configuration..."
+# --- Step 8: Generate config and .env ---
+echo "==> [8/10] Generating configuration..."
 ENV_FILE="$REPO_DIR/.env"
 
+# Preserve existing token if present
 if [[ -f "$ENV_FILE" ]]; then
-  echo "  .env already exists, preserving existing token."
   GATEWAY_TOKEN="$(grep -oP 'OPENCLAW_GATEWAY_TOKEN=\K.*' "$ENV_FILE" 2>/dev/null || true)"
 fi
-
 if [[ -z "${GATEWAY_TOKEN:-}" ]]; then
   GATEWAY_TOKEN="$(openssl rand -hex 32)"
 fi
@@ -113,29 +149,128 @@ OPENCLAW_BRIDGE_PORT=18790
 OPENCLAW_CONFIG_DIR=$HOME/.openclaw
 OPENCLAW_WORKSPACE_DIR=$HOME/.openclaw/workspace
 
-# Placeholder vars referenced by docker-compose.yml (set if needed)
+# Placeholder vars referenced by docker-compose.yml
 CLAUDE_AI_SESSION_KEY=
 CLAUDE_WEB_SESSION_KEY=
 CLAUDE_WEB_COOKIE=
 EOF
 
-# Restrict .env permissions (contains gateway token)
 chmod 600 "$ENV_FILE"
-echo "  .env written to $ENV_FILE (mode 600)"
-echo "  Gateway token: $GATEWAY_TOKEN"
 
 # Ensure .env is gitignored
 if ! grep -qxF '.env' "$REPO_DIR/.gitignore" 2>/dev/null; then
   echo '.env' >> "$REPO_DIR/.gitignore"
 fi
 
-# --- Step 7: Build Docker image from source ---
-echo "==> [7/8] Building Docker image from source (this may take several minutes)..."
+# Write openclaw.json with model config
+CONFIG_FILE="$HOME/.openclaw/openclaw.json"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  MODEL_PROVIDER="${MODEL%%/*}"
+  cat > "$CONFIG_FILE" <<JSONEOF
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "$MODEL"
+      },
+      "workspace": "/home/node/.openclaw/workspace",
+      "compaction": {
+        "mode": "safeguard"
+      },
+      "maxConcurrent": 4,
+      "subagents": {
+        "maxConcurrent": 8
+      }
+    }
+  },
+  "gateway": {
+    "port": 18789,
+    "mode": "local",
+    "bind": "loopback",
+    "auth": {
+      "mode": "token",
+      "token": "$GATEWAY_TOKEN"
+    }
+  },
+  "channels": {
+    "whatsapp": {
+      "dmPolicy": "allowlist",
+      "selfChatMode": true,
+      "groupPolicy": "allowlist",
+      "mediaMaxMb": 50,
+      "debounceMs": 0
+    }
+  },
+  "plugins": {
+    "entries": {
+      "whatsapp": {
+        "enabled": true
+      }
+    }
+  },
+  "skills": {
+    "install": {
+      "nodeManager": "pnpm"
+    }
+  },
+  "commands": {
+    "native": "auto",
+    "nativeSkills": "auto"
+  },
+  "messages": {
+    "ackReactionScope": "group-mentions"
+  }
+}
+JSONEOF
+  echo "  Config written: $CONFIG_FILE"
+else
+  echo "  Config already exists, preserving: $CONFIG_FILE"
+fi
+
+# Write API key to agent auth store if provided via env
+AUTH_PROFILES="$HOME/.openclaw/agents/main/agent/auth-profiles.json"
+if [[ -n "${GOOGLE_AI_API_KEY:-}" ]]; then
+  cat > "$AUTH_PROFILES" <<AUTHEOF
+{
+  "google:default": {
+    "provider": "google",
+    "mode": "api_key",
+    "apiKey": "$GOOGLE_AI_API_KEY"
+  }
+}
+AUTHEOF
+  echo "  Google AI API key written to agent auth store"
+elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+  cat > "$AUTH_PROFILES" <<AUTHEOF
+{
+  "anthropic:default": {
+    "provider": "anthropic",
+    "mode": "api_key",
+    "apiKey": "$ANTHROPIC_API_KEY"
+  }
+}
+AUTHEOF
+  echo "  Anthropic API key written to agent auth store"
+else
+  echo "  No API key provided. Set GOOGLE_AI_API_KEY or ANTHROPIC_API_KEY and re-run,"
+  echo "  or configure auth later via: docker exec -it openclaw-gateway node dist/index.js configure --section auth"
+fi
+
+# Fix ownership so Docker container (uid 1000) can read/write
+sudo chown -R 1000:1000 "$HOME/.openclaw"
+
+echo "  Gateway token: $GATEWAY_TOKEN"
+echo "  Model: $MODEL"
+
+# --- Step 9: Build Docker image from source ---
+echo "==> [9/10] Building Docker image from source (this may take several minutes)..."
 cd "$REPO_DIR"
 
+# Clean up previous Docker build cache to free disk space
+$DOCKER_CMD system prune -af >/dev/null 2>&1 || true
+
 # Patch Dockerfile to increase Node heap for low-memory VMs.
-# The TypeScript build OOMs at Node's default heap limit.
-# Set NODE_OPTIONS early so both pnpm build and pnpm ui:build get enough heap.
+# The TypeScript build OOMs at Node's default heap limit on e2-medium (4GB RAM).
 PATCHED_DOCKERFILE="$REPO_DIR/Dockerfile.gcp"
 awk '
   /^RUN pnpm install --frozen-lockfile$/ {
@@ -146,67 +281,99 @@ awk '
   { print }
 ' "$REPO_DIR/Dockerfile" > "$PATCHED_DOCKERFILE"
 
-# Build the image directly (docker-compose.yml has no build: directive)
+# Build the image (docker-compose.yml has no build: directive)
 $DOCKER_CMD build -t "$IMAGE_NAME" -f "$PATCHED_DOCKERFILE" .
 
 echo "  Image built: $IMAGE_NAME"
 
-# --- Step 8: Start gateway ---
-echo "==> [8/8] Starting gateway via Docker Compose..."
+# --- Step 10: Start gateway ---
+echo "==> [10/10] Starting gateway..."
 
-# Override port binding to loopback only for security
-# The compose file exposes 18789, we ensure it's only on 127.0.0.1
-$COMPOSE_CMD up -d openclaw-gateway
+# Stop any existing container
+$DOCKER_CMD stop openclaw-gateway 2>/dev/null || true
+$DOCKER_CMD rm openclaw-gateway 2>/dev/null || true
+$DOCKER_CMD compose -f "$REPO_DIR/docker-compose.yml" down 2>/dev/null || true
+
+# Build docker run args for API keys
+API_KEY_ARGS=()
+if [[ -n "${GOOGLE_AI_API_KEY:-}" ]]; then
+  API_KEY_ARGS+=(-e "GOOGLE_AI_API_KEY=$GOOGLE_AI_API_KEY")
+fi
+if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+  API_KEY_ARGS+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+fi
+
+# Start gateway with --allow-unconfigured so the web dashboard works without pairing
+$DOCKER_CMD run -d \
+  --name openclaw-gateway \
+  --env-file "$ENV_FILE" \
+  "${API_KEY_ARGS[@]}" \
+  -v "$HOME/.openclaw:/home/node/.openclaw" \
+  -v "$HOME/.openclaw/workspace:/home/node/.openclaw/workspace" \
+  -p 18789:18789 \
+  -p 18790:18790 \
+  --init \
+  --restart unless-stopped \
+  "$IMAGE_NAME" \
+  node dist/index.js gateway --allow-unconfigured --bind lan --port 18789
+
+# Wait for gateway to start
+sleep 5
 
 echo ""
 echo "============================================"
 echo "  Setup complete!"
 echo "============================================"
 echo ""
-echo "Gateway status:"
-$COMPOSE_CMD ps
-echo ""
 
 # --- Post-install verification ---
 echo "==> Verifying installation..."
-echo ""
 
-# Check container is running
-if $COMPOSE_CMD ps --status running | grep -q openclaw-gateway; then
+if $DOCKER_CMD ps --format '{{.Names}}' | grep -q openclaw-gateway; then
   echo "  [OK] Gateway container is running"
 else
   echo "  [!!] Gateway container is NOT running. Check logs:"
-  echo "       cd $REPO_DIR && $DOCKER_CMD compose logs openclaw-gateway"
+  echo "       $DOCKER_CMD logs openclaw-gateway"
 fi
 
-# Check port binding
 if ss -ltnp 2>/dev/null | grep -q ":18789"; then
   echo "  [OK] Port 18789 is listening"
 else
   echo "  [!!] Port 18789 is not listening yet (may still be starting)"
 fi
 
+# Show model from logs
+AGENT_MODEL="$($DOCKER_CMD logs openclaw-gateway 2>&1 | grep -o 'agent model: [^ ]*' | tail -1 || true)"
+if [[ -n "$AGENT_MODEL" ]]; then
+  echo "  [OK] $AGENT_MODEL"
+fi
+
 echo ""
-echo "--- Quick Reference ---"
+echo "--- Dashboard ---"
 echo ""
-echo "View logs:"
-echo "  cd $REPO_DIR && $DOCKER_CMD compose logs -f openclaw-gateway"
+echo "  http://127.0.0.1:18789/?token=$GATEWAY_TOKEN"
 echo ""
-echo "Gateway token (save this):"
-echo "  $GATEWAY_TOKEN"
+echo "  Access from your laptop via SSH tunnel:"
+echo "    gcloud compute ssh openclaw-server --zone=us-east1-c -- -L 18789:127.0.0.1:18789"
+echo "    Then open the dashboard URL above in your browser."
 echo ""
-echo "Access from your laptop (SSH tunnel - recommended):"
-echo "  gcloud compute ssh openclaw-server --zone=us-east1-c -- -L 18789:127.0.0.1:18789"
-echo "  Then open: http://127.0.0.1:18789/"
+echo "--- WhatsApp ---"
 echo ""
-echo "Run onboarding:"
-echo "  cd $REPO_DIR && $DOCKER_CMD compose run --rm openclaw-cli onboard --no-install-daemon"
+echo "  Link WhatsApp (scan QR code):"
+echo "    $DOCKER_CMD exec -it openclaw-gateway node dist/index.js channels login"
 echo ""
-echo "Health check:"
-echo "  cd $REPO_DIR && $DOCKER_CMD compose exec openclaw-gateway node dist/index.js health --token \"$GATEWAY_TOKEN\""
+echo "--- Useful Commands ---"
 echo ""
-echo "Run diagnostics:"
-echo "  cd $REPO_DIR && $DOCKER_CMD compose exec openclaw-gateway node dist/index.js doctor"
+echo "  View logs:     $DOCKER_CMD logs -f openclaw-gateway"
+echo "  Restart:       $DOCKER_CMD restart openclaw-gateway"
+echo "  Health check:  $DOCKER_CMD exec openclaw-gateway node dist/index.js health --token \"$GATEWAY_TOKEN\""
+echo "  Diagnostics:   $DOCKER_CMD exec openclaw-gateway node dist/index.js doctor"
 echo ""
-echo "Update later:"
-echo "  cd $REPO_DIR && git pull && $DOCKER_CMD build -t $IMAGE_NAME -f Dockerfile . && $DOCKER_CMD compose up -d"
+echo "  Update later:"
+echo "    cd $REPO_DIR && git pull && $DOCKER_CMD build -t $IMAGE_NAME -f Dockerfile.gcp . && $DOCKER_CMD restart openclaw-gateway"
+echo ""
+echo "  Change model:"
+echo "    Edit ~/.openclaw/openclaw.json (agents.defaults.model.primary)"
+echo "    Then: $DOCKER_CMD restart openclaw-gateway"
+echo ""
+echo "  Gateway token: $GATEWAY_TOKEN"
