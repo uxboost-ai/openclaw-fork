@@ -53,18 +53,24 @@ echo "  Disk: $(df -h / | awk 'NR==2{print $2 " total, " $4 " available"}')"
 
 # --- Step 3: Set up swap (prevents OOM during Docker build) ---
 echo "==> [3/10] Configuring swap..."
-if swapon --show | grep -q .; then
+# Use full path since /sbin may not be in PATH on some Debian/GCP images
+SWAPON="$(command -v swapon 2>/dev/null || echo /sbin/swapon)"
+MKSWAP="$(command -v mkswap 2>/dev/null || echo /sbin/mkswap)"
+
+if sudo "$SWAPON" --show 2>/dev/null | grep -q .; then
   echo "  Swap already active: $(free -h | awk '/Swap/{print $2}')"
 else
-  sudo fallocate -l 4G /swapfile
-  sudo chmod 600 /swapfile
-  sudo mkswap /swapfile >/dev/null
-  sudo swapon /swapfile
+  if [[ ! -f /swapfile ]]; then
+    sudo fallocate -l 4G /swapfile
+    sudo chmod 600 /swapfile
+    sudo "$MKSWAP" /swapfile >/dev/null
+  fi
+  sudo "$SWAPON" /swapfile 2>/dev/null || true
   # Make persistent across reboots
   if ! grep -q '/swapfile' /etc/fstab 2>/dev/null; then
     echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
   fi
-  echo "  Swap created: 4GB"
+  echo "  Swap configured: 4GB"
 fi
 
 # --- Step 4: Docker ---
