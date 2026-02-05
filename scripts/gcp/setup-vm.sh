@@ -133,12 +133,18 @@ fi
 echo "==> [7/8] Building Docker image from source (this may take several minutes)..."
 cd "$REPO_DIR"
 
-# Patch Dockerfile to increase Node heap for low-memory VMs (e2-medium = 2GB).
-# The TypeScript build OOMs at the default 1.5GB heap limit.
-# We set NODE_OPTIONS before the build step so pnpm build gets enough heap.
+# Patch Dockerfile to increase Node heap for low-memory VMs.
+# The TypeScript build OOMs at Node's default heap limit.
+# Set NODE_OPTIONS early so both pnpm build and pnpm ui:build get enough heap.
 PATCHED_DOCKERFILE="$REPO_DIR/Dockerfile.gcp"
-sed 's/^RUN OPENCLAW_A2UI_SKIP_MISSING=1 pnpm build$/ENV NODE_OPTIONS="--max-old-space-size=1024"\nRUN OPENCLAW_A2UI_SKIP_MISSING=1 pnpm build/' \
-  "$REPO_DIR/Dockerfile" > "$PATCHED_DOCKERFILE"
+awk '
+  /^RUN pnpm install --frozen-lockfile$/ {
+    print "ENV NODE_OPTIONS=\"--max-old-space-size=2048\""
+    print
+    next
+  }
+  { print }
+' "$REPO_DIR/Dockerfile" > "$PATCHED_DOCKERFILE"
 
 # Build the image directly (docker-compose.yml has no build: directive)
 $DOCKER_CMD build -t "$IMAGE_NAME" -f "$PATCHED_DOCKERFILE" .
