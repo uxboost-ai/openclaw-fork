@@ -1,6 +1,8 @@
 import type { OpenClawConfig } from "../config/config.js";
 
-export const DEFAULT_PI_COMPACTION_RESERVE_TOKENS_FLOOR = 20_000;
+// Lowered from 20k to 16k: delays compaction slightly so the system avoids
+// unnecessary summarization API calls when the context window still has room.
+export const DEFAULT_PI_COMPACTION_RESERVE_TOKENS_FLOOR = 16_000;
 
 type PiSettingsManagerLike = {
   getCompactionReserveTokens: () => number;

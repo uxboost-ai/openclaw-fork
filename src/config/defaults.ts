@@ -397,7 +397,7 @@ export function applyContextPruningDefaults(cfg: OpenClawConfig): OpenClawConfig
       }
       nextModels[key] = {
         ...(current as Record<string, unknown>),
-        params: { ...params, cacheRetention: "short" },
+        params: { ...params, cacheRetention: "long" },
       };
       modelsMutated = true;
     }
@@ -413,7 +413,7 @@ export function applyContextPruningDefaults(cfg: OpenClawConfig): OpenClawConfig
         if (typeof params.cacheRetention !== "string") {
           nextModels[key] = {
             ...(current as Record<string, unknown>),
-            params: { ...params, cacheRetention: "short" },
+            params: { ...params, cacheRetention: "long" },
           };
           modelsMutated = true;
         }

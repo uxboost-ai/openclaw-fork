@@ -101,7 +101,7 @@ describe("config pruning defaults", () => {
       expect(cfg.agents?.defaults?.heartbeat?.every).toBe("30m");
       expect(
         cfg.agents?.defaults?.models?.["anthropic/claude-opus-4-5"]?.params?.cacheRetention,
-      ).toBe("short");
+      ).toBe("long");
     });
   });
 

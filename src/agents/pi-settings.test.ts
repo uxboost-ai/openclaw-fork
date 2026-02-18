@@ -8,7 +8,7 @@ import {
 describe("ensurePiCompactionReserveTokens", () => {
   it("bumps reserveTokens when below floor", () => {
     const settingsManager = {
-      getCompactionReserveTokens: () => 16_384,
+      getCompactionReserveTokens: () => 12_000,
       applyOverrides: vi.fn(),
     };
 

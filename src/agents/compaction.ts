@@ -3,8 +3,9 @@ import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { estimateTokens, generateSummary } from "@mariozechner/pi-coding-agent";
 import { DEFAULT_CONTEXT_TOKENS } from "./defaults.js";
 
-export const BASE_CHUNK_RATIO = 0.4;
-export const MIN_CHUNK_RATIO = 0.15;
+// Smaller chunks produce more focused summaries and use fewer summarization tokens.
+export const BASE_CHUNK_RATIO = 0.35;
+export const MIN_CHUNK_RATIO = 0.12;
 export const SAFETY_MARGIN = 1.2; // 20% buffer for estimateTokens() inaccuracy
 const DEFAULT_SUMMARY_FALLBACK = "No prior history.";
 const DEFAULT_PARTS = 2;

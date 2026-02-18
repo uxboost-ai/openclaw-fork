@@ -49,14 +49,19 @@ export const DEFAULT_CONTEXT_PRUNING_SETTINGS: EffectiveContextPruningSettings =
   mode: "cache-ttl",
   ttlMs: 5 * 60 * 1000,
   keepLastAssistants: 3,
-  softTrimRatio: 0.3,
-  hardClearRatio: 0.5,
-  minPrunableToolChars: 50_000,
+  // Start soft-trimming earlier (25% vs 30%) and hard-clearing earlier (40% vs 50%)
+  // to reduce context size and input token costs per request.
+  softTrimRatio: 0.25,
+  hardClearRatio: 0.4,
+  // Allow hard-clearing smaller tool results (30k vs 50k chars) so stale results
+  // don't linger in context as long.
+  minPrunableToolChars: 30_000,
   tools: {},
   softTrim: {
-    maxChars: 4_000,
-    headChars: 1_500,
-    tailChars: 1_500,
+    // Tighter trim windows: keep less of oversized results (3k total vs 4k).
+    maxChars: 3_000,
+    headChars: 1_200,
+    tailChars: 1_200,
   },
   hardClear: {
     enabled: true,
